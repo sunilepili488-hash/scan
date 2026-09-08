@@ -24,8 +24,6 @@ export default function Scanner() {
   const [busy, setBusy] = useState(false);
   const [ending, setEnding] = useState(false);
   const [cameraError, setCameraError] = useState("");
-  // FIX 1: Track when camera is truly ready (videoWidth > 0)
-  const [cameraReady, setCameraReady] = useState(false);
 
   useEffect(() => {
     startCamera();
@@ -43,21 +41,7 @@ export default function Scanner() {
       trackRef.current = stream.getVideoTracks()[0] || null;
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-
-        // FIX 2: Wait for video metadata to load before marking camera as ready
-        // This ensures videoWidth/videoHeight are non-zero before we try to capture
-        await new Promise<void>((resolve) => {
-          const video = videoRef.current!;
-          if (video.readyState >= 1 && video.videoWidth > 0) {
-            // Already have metadata
-            resolve();
-          } else {
-            video.addEventListener("loadedmetadata", () => resolve(), { once: true });
-          }
-        });
-
         await videoRef.current.play();
-        setCameraReady(true); // Mark ready only AFTER metadata is loaded
       }
     } catch {
       setCameraError("Could not access the camera. Please allow camera permission and reload.");
@@ -85,10 +69,6 @@ export default function Scanner() {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas) return null;
-
-    // FIX 3: Guard against zero dimensions — this was the crash source
-    if (!video.videoWidth || !video.videoHeight) return null;
-
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
     const ctx = canvas.getContext("2d");
@@ -102,10 +82,6 @@ export default function Scanner() {
     if (!canvas) return 255;
     const ctx = canvas.getContext("2d");
     if (!ctx) return 255;
-
-    // FIX 4: Guard against zero canvas size before getImageData
-    if (!canvas.width || !canvas.height) return 255;
-
     const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
     let sum = 0;
     let count = 0;
@@ -117,8 +93,7 @@ export default function Scanner() {
   }
 
   async function runCaptureSession() {
-    // FIX 5: Don't start scanning until camera is truly ready
-    if (busy || cameraError || !sessionId || !cameraReady) return;
+    if (busy || cameraError || !sessionId) return;
     setBusy(true);
     setState("capturing");
 
@@ -166,12 +141,11 @@ export default function Scanner() {
   }
 
   useEffect(() => {
-    // FIX 6: cameraReady added to dependency — triggers scan only once camera is ready
-    if (state !== "idle" || busy || cameraError || !cameraReady) return;
+    if (state !== "idle" || busy || cameraError) return;
     const t = setTimeout(runCaptureSession, 400);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state, cameraError, cameraReady]);
+  }, [state, cameraError]);
 
   async function handleStop() {
     if (!sessionId) return;
@@ -199,13 +173,6 @@ export default function Scanner() {
       <div className="absolute right-4 top-20 rounded-full bg-black/50 px-3 py-1 text-sm font-medium text-white">
         {scannedCount} scanned
       </div>
-
-      {/* Show loading indicator while camera initializes */}
-      {!cameraReady && !cameraError && (
-        <div className="absolute inset-0 flex items-center justify-center">
-          <p className="text-white/70 text-sm">Starting camera…</p>
-        </div>
-      )}
 
       {cameraError && (
         <div className="absolute inset-0 flex items-center justify-center bg-black px-6 text-center text-white">
