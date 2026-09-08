@@ -27,37 +27,135 @@ def sharpness_score(img: np.ndarray) -> float:
 
 
 def pick_best_frame(images: list[np.ndarray]) -> np.ndarray:
+    if len(images) == 1:
+        return images[0]
     scores = [sharpness_score(img) for img in images]
     best_idx = int(np.argmax(scores))
     return images[best_idx]
 
 
+def _order_corners(pts: np.ndarray) -> np.ndarray:
+    """Order 4 points as top-left, top-right, bottom-right, bottom-left."""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+
+def deskew_and_crop(img: np.ndarray) -> np.ndarray:
+    """Find the ID card's outline and perspective-warp it flat.
+
+    Unlike Tesseract's OSD (which only corrects 90-degree multiples and
+    fails on arbitrary tilts like 45 degrees), this finds the card's actual
+    rectangular edges via contour detection and geometrically un-warps it
+    to any angle. Falls back gracefully to a simple rotation, or the
+    original image, if no clean card outline is found.
+    """
+    h0, w0 = img.shape[:2]
+    work_w = 700
+    scale = work_w / w0 if w0 > work_w else 1.0
+    small = cv2.resize(img, (int(w0 * scale), int(h0 * scale))) if scale != 1.0 else img.copy()
+
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return img
+
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+    card_contour = None
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 0.15 * small.shape[0] * small.shape[1]:
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            card_contour = approx.reshape(4, 2)
+            break
+
+    if card_contour is None:
+        # Fallback: rotate using the largest contour's minAreaRect angle.
+        largest = contours[0]
+        if cv2.contourArea(largest) < 0.1 * small.shape[0] * small.shape[1]:
+            return img
+        rect = cv2.minAreaRect(largest)
+        angle = rect[-1]
+        if angle < -45:
+            angle += 90
+        (h, w) = img.shape[:2]
+        center = (w // 2, h // 2)
+        m = cv2.getRotationMatrix2D(center, angle, 1.0)
+        return cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    pts = card_contour.astype("float32") / scale
+    rect = _order_corners(pts)
+    (tl, tr, br, bl) = rect
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_width = int(max(width_a, width_b))
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_height = int(max(height_a, height_b))
+    if max_width < 50 or max_height < 50:
+        return img
+
+    dst = np.array(
+        [[0, 0], [max_width - 1, 0], [max_width - 1, max_height - 1], [0, max_height - 1]],
+        dtype="float32",
+    )
+    m = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(img, m, (max_width, max_height))
+
+    # ID cards print landscape; if the crop came out portrait, rotate 90.
+    if warped.shape[0] > warped.shape[1] * 1.2:
+        warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+
+    return warped
+
+
 def preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    gray = cv2.medianBlur(gray, 3)  # cheaper than bilateralFilter, still denoises
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
     thresh = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 11
     )
     return thresh
 
 
-def run_ocr(img: np.ndarray) -> str:
-    processed = preprocess_for_ocr(img)
-    # OCR the original orientation. The card may be rotated by the student;
-    # pytesseract's OSD (orientation & script detection) helps auto-correct.
+def _fix_upside_down(processed: np.ndarray) -> np.ndarray:
+    """Once the card has been deskewed it's axis-aligned, so Tesseract's OSD
+    only has to tell 0 vs 180 (or an occasional 90/270) apart, which it does
+    quickly and reliably — unlike trying to OSD an arbitrarily tilted image."""
     try:
-        osd = pytesseract.image_to_osd(processed)
+        osd = pytesseract.image_to_osd(processed, config="--psm 0")
         rotate_match = re.search(r"Rotate: (\d+)", osd)
         angle = int(rotate_match.group(1)) if rotate_match else 0
-        if angle != 0:
-            (h, w) = processed.shape[:2]
-            center = (w // 2, h // 2)
-            m = cv2.getRotationMatrix2D(center, -angle, 1.0)
-            processed = cv2.warpAffine(processed, m, (w, h))
+        if angle == 180:
+            processed = cv2.rotate(processed, cv2.ROTATE_180)
+        elif angle == 90:
+            processed = cv2.rotate(processed, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif angle == 270:
+            processed = cv2.rotate(processed, cv2.ROTATE_90_CLOCKWISE)
     except Exception:
-        pass  # OSD can fail on very unclear images; fall back to as-is
+        pass  # OSD can still fail on very unclear images; fall back to as-is
+    return processed
 
-    text = pytesseract.image_to_string(processed)
+
+def run_ocr(img: np.ndarray) -> str:
+    img = deskew_and_crop(img)
+    processed = preprocess_for_ocr(img)
+    processed = _fix_upside_down(processed)
+    text = pytesseract.image_to_string(processed, config="--oem 3 --psm 6")
     return text.strip()
 
 
