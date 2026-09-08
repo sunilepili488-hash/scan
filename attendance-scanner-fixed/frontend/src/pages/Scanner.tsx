@@ -154,10 +154,14 @@ export default function Scanner() {
         setState("not_scanned");
         playErrorSound();
       }
-    } catch {
-      setState("not_scanned");
-      playErrorSound();
-    }
+    } catch (error: any) {
+  console.error("SCAN ERROR:", error);
+  console.error("SCAN RESPONSE:", error?.response?.data);
+  console.error("SCAN STATUS:", error?.response?.status);
+
+  setState("not_scanned");
+  playErrorSound();
+}
 
     setTimeout(() => {
       setState("idle");
