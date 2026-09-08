@@ -5,8 +5,10 @@ import { playSuccessSound, playErrorSound } from "../lib/sounds";
 
 type ScanState = "idle" | "capturing" | "matched" | "already_marked" | "no_match" | "not_scanned";
 
-const CAPTURE_WINDOW_MS = 6000;
-const FRAME_INTERVAL_MS = 500;
+const MAX_WAIT_MS = 2500; // hard safety cap — never wait longer than this
+const FRAME_INTERVAL_MS = 120; // poll fast so a sharp frame is caught almost instantly
+const SHARPNESS_EXIT_THRESHOLD = 14; // tuned for a JPEG @0.8 downscaled frame; raise if it exits too early on blurry frames, lower if it never exits early
+const MAX_CAPTURE_WIDTH = 1000; // downscaling cuts both upload time and OCR time server-side
 
 export default function Scanner() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -24,7 +26,7 @@ export default function Scanner() {
   const [busy, setBusy] = useState(false);
   const [ending, setEnding] = useState(false);
   const [cameraError, setCameraError] = useState("");
-  // FIX 1: Track when camera is truly ready (videoWidth > 0)
+  // Track when camera is truly ready (videoWidth > 0)
   const [cameraReady, setCameraReady] = useState(false);
 
   useEffect(() => {
@@ -44,12 +46,11 @@ export default function Scanner() {
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
 
-        // FIX 2: Wait for video metadata to load before marking camera as ready
+        // Wait for video metadata to load before marking camera as ready
         // This ensures videoWidth/videoHeight are non-zero before we try to capture
         await new Promise<void>((resolve) => {
           const video = videoRef.current!;
           if (video.readyState >= 1 && video.videoWidth > 0) {
-            // Already have metadata
             resolve();
           } else {
             video.addEventListener("loadedmetadata", () => resolve(), { once: true });
@@ -86,15 +87,19 @@ export default function Scanner() {
     const canvas = canvasRef.current;
     if (!video || !canvas) return null;
 
-    // FIX 3: Guard against zero dimensions — this was the crash source
+    // Guard against zero dimensions — this was the crash source
     if (!video.videoWidth || !video.videoHeight) return null;
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    // Downscale: sending a smaller frame cuts upload time AND server-side
+    // OCR time, with no real accuracy loss (a card only needs ~800-1000px
+    // of width to OCR cleanly).
+    const scale = Math.min(1, MAX_CAPTURE_WIDTH / video.videoWidth);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    return canvas.toDataURL("image/jpeg", 0.85);
+    return canvas.toDataURL("image/jpeg", 0.8);
   }
 
   function estimateBrightness(): number {
@@ -103,7 +108,7 @@ export default function Scanner() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return 255;
 
-    // FIX 4: Guard against zero canvas size before getImageData
+    // Guard against zero canvas size before getImageData
     if (!canvas.width || !canvas.height) return 255;
 
     const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -116,31 +121,83 @@ export default function Scanner() {
     return count ? sum / count : 255;
   }
 
+  // Cheap proxy for "is this frame in focus" — average local brightness
+  // gradient sampled on a stride so it stays fast even on every frame.
+  // Runs on the canvas that captureFrame() just drew, so no extra decode.
+  function estimateSharpness(): number {
+    const canvas = canvasRef.current;
+    if (!canvas) return 0;
+    const ctx = canvas.getContext("2d");
+    if (!ctx || !canvas.width || !canvas.height) return 0;
+
+    const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    let edgeSum = 0;
+    let count = 0;
+    const rowStep = Math.max(1, Math.floor(height / 60));
+    const colStep = 4;
+    for (let y = 0; y < height; y += rowStep) {
+      const rowStart = y * width * 4;
+      for (let x = 0; x < width - colStep; x += colStep) {
+        const i = rowStart + x * 4;
+        const j = rowStart + (x + colStep) * 4;
+        const g1 = (data[i] + data[i + 1] + data[i + 2]) / 3;
+        const g2 = (data[j] + data[j + 1] + data[j + 2]) / 3;
+        edgeSum += Math.abs(g1 - g2);
+        count++;
+      }
+    }
+    return count ? edgeSum / count : 0;
+  }
+
   async function runCaptureSession() {
-    // FIX 5: Don't start scanning until camera is truly ready
+    // Don't start scanning until camera is truly ready
     if (busy || cameraError || !sessionId || !cameraReady) return;
     setBusy(true);
     setState("capturing");
 
-    const frames: string[] = [];
     const start = Date.now();
+    let bestFrame: string | null = null;
+    let bestScore = -1;
 
+    // Quick brightness check on the first frame to decide about torch.
     captureFrame();
     const brightness = estimateBrightness();
     const torchOn = brightness < 60;
     if (torchOn) await setTorch(true);
 
-    while (Date.now() - start < CAPTURE_WINDOW_MS) {
+    // Poll fast and exit the MOMENT a sharp-enough frame shows up — this is
+    // what makes it feel instant instead of waiting out a fixed window.
+    while (Date.now() - start < MAX_WAIT_MS) {
       const frame = captureFrame();
-      if (frame) frames.push(frame);
+      if (frame) {
+        const score = estimateSharpness();
+        if (score > bestScore) {
+          bestScore = score;
+          bestFrame = frame;
+        }
+        if (score >= SHARPNESS_EXIT_THRESHOLD) {
+          break;
+        }
+      }
       await new Promise((r) => setTimeout(r, FRAME_INTERVAL_MS));
-      if (frames.length >= 4 && Date.now() - start > 1500) break;
     }
 
     if (torchOn) await setTorch(false);
 
+    if (!bestFrame) {
+      setState("not_scanned");
+      playErrorSound();
+      setTimeout(() => {
+        setState("idle");
+        setBusy(false);
+      }, 1500);
+      return;
+    }
+
     try {
-      const result = await scanAndMatch(sessionId, frames);
+      // Send just the single best frame — smaller upload, less server-side
+      // work, and the server no longer has to pick-among-many either.
+      const result = await scanAndMatch(sessionId, [bestFrame]);
       setScannedCount(result.scanned_count);
 
       if (result.status === "matched" || result.status === "already_marked") {
@@ -155,24 +212,24 @@ export default function Scanner() {
         playErrorSound();
       }
     } catch (error: any) {
-  console.error("SCAN ERROR:", error);
-  console.error("SCAN RESPONSE:", error?.response?.data);
-  console.error("SCAN STATUS:", error?.response?.status);
+      console.error("SCAN ERROR:", error);
+      console.error("SCAN RESPONSE:", error?.response?.data);
+      console.error("SCAN STATUS:", error?.response?.status);
 
-  setState("not_scanned");
-  playErrorSound();
-}
+      setState("not_scanned");
+      playErrorSound();
+    }
 
     setTimeout(() => {
       setState("idle");
       setBusy(false);
-    }, 2000);
+    }, 1500);
   }
 
   useEffect(() => {
-    // FIX 6: cameraReady added to dependency — triggers scan only once camera is ready
+    // cameraReady in dependency — triggers scan only once camera is ready
     if (state !== "idle" || busy || cameraError || !cameraReady) return;
-    const t = setTimeout(runCaptureSession, 400);
+    const t = setTimeout(runCaptureSession, 200);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state, cameraError, cameraReady]);
